@@ -25,10 +25,12 @@
 
 #include "collectd.h"
 
+
 #include "plugin.h"
 #include "common.h"
 #include "utils_format_json.h"
 #include "utils_format_kairosdb.h"
+#include <unistd.h>
 
 #include <curl/curl.h>
 
@@ -60,6 +62,7 @@ struct wh_callback_s
         int   low_speed_limit;
         time_t low_speed_time;
         int timeout;
+        int retry_timeout_max;
 
 #define WH_FORMAT_COMMAND  0
 #define WH_FORMAT_JSON     1
@@ -82,7 +85,7 @@ struct wh_callback_s
 };
 typedef struct wh_callback_s wh_callback_t;
 
-static void wh_log_http_error (wh_callback_t *cb)
+/*static void wh_log_http_error (wh_callback_t *cb)
 {
         if (!cb->log_http_error)
                 return;
@@ -92,7 +95,20 @@ static void wh_log_http_error (wh_callback_t *cb)
         curl_easy_getinfo (cb->curl, CURLINFO_RESPONSE_CODE, &http_code);
 
         if (http_code != 200)
-                INFO ("write_http plugin: HTTP Error code: %lu", http_code);
+                DEBUG ("write_http plugin: HTTP Error code: %lu", http_code);
+}*/
+
+static int get_http_error_code (wh_callback_t *cb)
+{
+        long http_code = 0;
+
+        curl_easy_getinfo (cb->curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+        if (http_code == 200 || http_code == 201)
+            return 0;
+        else
+            DEBUG ("write_http plugin: HTTP Error code: %lu", http_code);
+        return 1;
 }
 
 static void wh_reset_buffer (wh_callback_t *cb)  /* {{{ */
@@ -117,17 +133,39 @@ static void wh_reset_buffer (wh_callback_t *cb)  /* {{{ */
 static int wh_post_nolock (wh_callback_t *cb, char const *data) /* {{{ */
 {
         int status = 0;
-
+        int http_code = 0;
+        
         curl_easy_setopt (cb->curl, CURLOPT_POSTFIELDS, data);
+
         status = curl_easy_perform (cb->curl);
+        http_code = get_http_error_code(cb);
+        
+        int retry_timeout = cb->timeout;
+        if (retry_timeout == 0)
+            retry_timeout = 1000;
 
-        wh_log_http_error (cb);
-
-        if (status != CURLE_OK)
+        int is_last_retry = 0;
+        while (status != CURLE_OK || http_code != 0)
         {
-                ERROR ("write_http plugin: curl_easy_perform failed with "
-                                "status %i: %s",
-                                status, cb->curl_errbuf);
+                if (is_last_retry) 
+                {
+                    ERROR ("write_http plugin: curl_easy_perform failed with "
+                                                "curl status %i: http status %i even after retrying multiple times",
+                                                status, http_code);
+                    break;
+                }
+                if (retry_timeout >= cb->retry_timeout_max)
+                {
+                    retry_timeout = cb->retry_timeout_max;
+                    is_last_retry = 1;
+                }
+                DEBUG ("write_http plugin: curl_easy_perform initial failed so retrying"
+                                            "with timeout %i:",
+                                            retry_timeout);
+                usleep(retry_timeout*1000);
+                status = curl_easy_perform (cb->curl);
+                http_code = get_http_error_code(cb);
+                retry_timeout = retry_timeout*2;
         }
         return (status);
 } /* }}} wh_post_nolock */
@@ -655,7 +693,10 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
         cb->format = WH_FORMAT_COMMAND;
         cb->sslversion = CURL_SSLVERSION_DEFAULT;
         cb->low_speed_limit = 0;
-        cb->timeout = 0;
+        //default is 1 sec
+        cb->timeout = 1000;
+        //default is 120 sec
+        cb->retry_timeout_max = 120000;
         cb->log_http_error = 0;
         cb->headers = NULL;
         cb->send_metrics = 1;
@@ -740,6 +781,8 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
                         status = cf_util_get_int (child, &cb->low_speed_limit);
                 else if (strcasecmp ("Timeout", child->key) == 0)
                         status = cf_util_get_int (child, &cb->timeout);
+                else if (strcasecmp ("MaxRetryTimeout", child->key) == 0)
+                        status = cf_util_get_int (child, &cb->retry_timeout_max);
                 else if (strcasecmp ("LogHttpError", child->key) == 0)
                         status = cf_util_get_boolean (child, &cb->log_http_error);
                 else if (strcasecmp ("Header", child->key) == 0)
